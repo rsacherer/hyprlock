@@ -46,7 +46,10 @@ int conv(int num_msg, const struct pam_message** msg, struct pam_response** resp
                     CONVERSATIONSTATE->prompt = PROMPT;
                     g_pHyprlock->enqueueForceUpdateTimers();
 
-                    CONVERSATIONSTATE->waitForInput();
+                    // On auto-retry after a transient system error, the password is
+                    // already set — skip blocking and reuse it directly.
+                    if (!CONVERSATIONSTATE->autoRetry)
+                        CONVERSATIONSTATE->waitForInput();
                 }
 
                 // Needed for unlocks via SIGUSR1
@@ -77,8 +80,12 @@ int conv(int num_msg, const struct pam_message** msg, struct pam_response** resp
 }
 
 CPam::CPam() {
-    static const auto PAMMODULE = g_pConfigManager->getValue<Hyprlang::STRING>("auth:pam:module");
-    m_sPamModule                = *PAMMODULE;
+    static const auto PAMMODULE      = g_pConfigManager->getValue<Hyprlang::STRING>("auth:pam:module");
+    static const auto RETRYONERROR   = g_pConfigManager->getValue<Hyprlang::INT>("auth:pam:retry_on_error");
+    static const auto RETRYDELAY     = g_pConfigManager->getValue<Hyprlang::INT>("auth:pam:retry_delay");
+    m_sPamModule                     = *PAMMODULE;
+    m_bRetryOnError                  = *RETRYONERROR;
+    m_iRetryDelayMs                  = *RETRYDELAY;
 
     if (!std::filesystem::exists(std::filesystem::path("/etc/pam.d/") / m_sPamModule)) {
         Log::logger->log(Log::ERR, R"(Pam module "/etc/pam.d/{}" does not exist! Falling back to "/etc/pam.d/su")", m_sPamModule);
@@ -141,6 +148,31 @@ bool CPam::auth() {
     handle = nullptr;
 
     m_sConversationState.waitingForPamAuth = false;
+
+    // PAM_SYSTEM_ERR (4) means an SSSD/PAM infrastructure transient failure,
+    // not a wrong password. Retry once after a short delay so that the user
+    // never has to type their password twice due to e.g. a dead krb5_child.
+    if (m_bRetryOnError && ret == PAM_SYSTEM_ERR && !m_sConversationState.input.empty() &&
+        !m_sConversationState.terminateRequested && !g_pHyprlock->isFadingOutOrTerminating()) {
+        Log::logger->log(Log::INFO, "auth: PAM_SYSTEM_ERR — retrying in {}ms with same credentials", m_iRetryDelayMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(m_iRetryDelayMs));
+
+        if (!m_sConversationState.terminateRequested && !g_pHyprlock->isFadingOutOrTerminating()) {
+            m_sConversationState.autoRetry         = true;
+            m_sConversationState.failTextFromPam   = false;
+            m_sConversationState.waitingForPamAuth = true;
+
+            pam_handle_t* retryHandle = nullptr;
+            ret                       = pam_start(m_sPamModule.c_str(), m_username.c_str(), &localConv, &retryHandle);
+            if (ret == PAM_SUCCESS)
+                ret = pam_authenticate(retryHandle, 0);
+            pam_end(retryHandle, ret);
+            retryHandle = nullptr;
+
+            m_sConversationState.autoRetry         = false;
+            m_sConversationState.waitingForPamAuth = false;
+        }
+    }
 
     if (ret != PAM_SUCCESS) {
         if (!m_sConversationState.failTextFromPam)
@@ -205,5 +237,6 @@ void CPam::resetConversation() {
     m_sConversationState.waitingForPamAuth = false;
     m_sConversationState.inputRequested    = false;
     m_sConversationState.failTextFromPam   = false;
+    m_sConversationState.autoRetry         = false;
     m_bBlockInput                          = false;
 }

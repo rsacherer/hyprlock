@@ -23,6 +23,7 @@ class CPam : public IAuthImplementation {
         bool                    waitingForPamAuth  = false;
         bool                    inputRequested     = false;
         bool                    failTextFromPam    = false;
+        bool                    autoRetry          = false;
         std::atomic_bool        terminateRequested = false;
         std::function<void()>   waitForInput       = []() {};
     };
@@ -46,7 +47,9 @@ class CPam : public IAuthImplementation {
     std::thread           m_thread;
     SPamConversationState m_sConversationState;
 
-    bool                  m_bBlockInput = false;
+    bool                  m_bBlockInput   = false;
+    bool                  m_bRetryOnError = true;
+    int                   m_iRetryDelayMs = 3000;
 
     std::string           m_sPamModule = "";
     std::string           m_username   = "";
